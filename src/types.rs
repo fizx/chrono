@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,36 @@ pub trait Dispatcher {
 
 pub trait Handler {
     fn handle(&self, req: Request) -> BoxedFuture<Response, String>;
+}
+
+pub trait HandlerMiddleware {
+    fn wrap(&self, handler: Arc<dyn Handler>) -> Arc<dyn Handler>;
+}
+
+pub struct HandlerMiddlewareChain {
+    middlewares: Vec<Box<dyn HandlerMiddleware>>,
+    handler: Arc<dyn Handler>,
+}
+
+impl HandlerMiddlewareChain {
+    pub fn new(handler: Arc<dyn Handler>) -> Self {
+        HandlerMiddlewareChain {
+            middlewares: Vec::new(),
+            handler,
+        }
+    }
+
+    pub fn add_middleware(&mut self, middleware: Box<dyn HandlerMiddleware>) {
+        self.middlewares.push(middleware);
+    }
+
+    pub fn wrap(&self) -> Arc<dyn Handler> {
+        let mut handler = self.handler.clone();
+        for middleware in self.middlewares.iter().rev() {
+            handler = middleware.wrap(handler);
+        }
+        handler
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -14,13 +14,13 @@ use wasm_bindgen::prelude::*;
 pub struct JsEvent {
     pub remote: bool,
     pub stateful: bool,
-    data: String, // pub data: std::sync::Arc<String>,
+    data: js_sys::Uint8Array, // pub data: std::sync::Arc<String>,
 }
 
 #[wasm_bindgen]
 impl JsEvent {
     #[wasm_bindgen(getter)]
-    pub fn data(&self) -> String {
+    pub fn data(&self) -> js_sys::Uint8Array {
         self.data.clone()
     }
 }
@@ -51,7 +51,7 @@ pub struct JsResponse {
     error_message: Option<String>,
     state: JsValue, // As above, using JsValue to encapsulate complex State
     replay: Vec<JsEvent>,
-    data: String,
+    data: js_sys::Uint8Array,
 }
 
 #[wasm_bindgen]
@@ -72,7 +72,7 @@ impl JsResponse {
     }
 
     #[wasm_bindgen(getter)]
-    pub fn data(&self) -> String {
+    pub fn data(&self) -> js_sys::Uint8Array {
         self.data.clone()
     }
 }

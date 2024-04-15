@@ -1,12 +1,8 @@
 use crate::types::{
     BoxedFuture, Closer, Dispatcher, Event, Executor, Handler, Request, Response, State,
 };
-
-use async_std::prelude::*;
 use async_std::task;
-use async_std::task_local;
-use futures::executor;
-use futures::future::{BoxFuture, FutureExt};
+use futures::future::FutureExt;
 use std::{
     cmp::min,
     collections::HashMap,
@@ -38,7 +34,7 @@ impl Default for FallbackDispatcherOptions {
 pub struct FallbackDispatcher {
     executor: Arc<dyn Executor>,
     options: FallbackDispatcherOptions,
-    state: State,
+    state: Arc<Mutex<State>>,
     local_handler: Arc<dyn Handler>,
     remote_handler: Arc<dyn Handler>,
     sync_queue: Arc<Mutex<Vec<Event>>>,
@@ -60,7 +56,7 @@ impl FallbackDispatcher {
         FallbackDispatcher {
             executor,
             options,
-            state,
+            state: Arc::new(Mutex::new(state)),
             local_handler,
             remote_handler,
             sync_queue: Arc::new(Mutex::new(Vec::new())),
@@ -78,32 +74,56 @@ impl FallbackDispatcher {
         }
     }
 
-    async fn handle_request(&self, events: Vec<Event>) {
-        // let response = (self.local_handler)(request.clone());
-        // self.state = response.state.clone();
+    async fn handle_request(&self, events: Vec<Event>) -> Result<(), String> {
+        // group events by event.remote and event.stateful
+        let groups = events.iter().fold(
+            HashMap::new(),
+            |mut acc: HashMap<(bool, bool), Vec<Event>>, event| {
+                let key = (event.remote, event.stateful);
+                acc.entry(key).or_insert_with(Vec::new).push(event.clone());
+                acc
+            },
+        );
+        for (_key, group) in groups {
+            let result = self.handle_batch(group).await;
+            if result.is_err() {
+                return result;
+            }
+        }
+        Ok(())
+    }
 
-        // let mut replay = response.replay.clone();
-        // if !request.events.is_empty() {
-        //     let response = (self.remote_handler)(request);
-        //     self.state = response.state.clone();
-        //     replay.extend(response.replay);
-        // }
-
-        // self.notify_subscribers(Response {
-        //     error_message: None,
-        //     state: self.state.clone(),
-        //     replay,
-        //     data: "".to_string(),
-        // });
-
-        // response
-        let rsp = Response {
-            error_message: None,
-            state: self.state.clone(),
-            replay: Vec::new(),
-            data: "".to_string(),
+    async fn handle_batch(&self, events: Vec<Event>) -> Result<(), String> {
+        if events.is_empty() {
+            return Err("Empty batch".to_string());
+        }
+        let stateful = events.first().unwrap().stateful;
+        let remote = events.first().unwrap().remote;
+        let state = self.state.lock().unwrap().clone();
+        let request = Request { events, state };
+        let handler = if remote {
+            self.remote_handler.clone()
+        } else {
+            self.local_handler.clone()
         };
-        self.notify_subscribers(rsp);
+
+        let response = handler.handle(request).await?;
+        if stateful {
+            *self.state.lock().unwrap() = response.state.clone();
+        }
+
+        let replay = response.replay.clone();
+        for event in replay.iter() {
+            if event.stateful {
+                self.sync_queue.lock().unwrap().insert(0, event.clone());
+            } else {
+                self.async_queue.lock().unwrap().insert(0, event.clone());
+            }
+        }
+
+        self.notify_subscribers(response);
+
+        Ok(())
     }
 
     fn tick(&self) {
@@ -121,7 +141,7 @@ impl FallbackDispatcher {
             *self.async_in_progress.lock().unwrap() += 1;
             self.executor.spawn(
                 async move {
-                    self_clone.handle_request(batch).await;
+                    self_clone.handle_request(batch).await?;
                     *self_clone.async_in_progress.lock().unwrap() -= 1;
                     self_clone.tick();
                     Ok(())
@@ -141,7 +161,7 @@ impl FallbackDispatcher {
             *self.sync_in_progress.lock().unwrap() += 1;
             self.executor.spawn(
                 async move {
-                    self_clone.handle_request(batch).await;
+                    self_clone.handle_request(batch).await?;
                     *self_clone.sync_in_progress.lock().unwrap() -= 1;
                     self_clone.tick();
                     Ok(())
@@ -179,26 +199,6 @@ impl Dispatcher for FallbackDispatcher {
         }))
     }
 }
-struct TestHandler {
-    pub prefix: String,
-}
-
-impl Handler for TestHandler {
-    fn handle(&self, req: Request) -> BoxedFuture<Response, String> {
-        let p = self.prefix.clone();
-        async move {
-            let cloned_state = req.state.clone();
-            let cloned_events = req.events.clone();
-            Ok(Response {
-                error_message: None,
-                state: cloned_state,
-                replay: vec![],
-                data: format!("{}: {:?}", p, cloned_events),
-            })
-        }
-        .boxed_local()
-    }
-}
 
 pub struct SingleThreadedAsyncStdExecutor;
 
@@ -212,19 +212,39 @@ impl Executor for SingleThreadedAsyncStdExecutor {
 mod tests {
     use std::time::Duration;
 
-    use crate::types::BoxedFuture;
+    use crate::types::HandlerMiddleware;
 
     use super::*;
 
     // Simulated handlers for testing
+    struct EchoHandler {
+        pub prefix: String,
+    }
+
+    impl Handler for EchoHandler {
+        fn handle(&self, req: Request) -> BoxedFuture<Response, String> {
+            let p = self.prefix.clone();
+            async move {
+                let cloned_state = req.state.clone();
+                let cloned_events = req.events.clone();
+                Ok(Response {
+                    error_message: None,
+                    state: cloned_state,
+                    replay: vec![],
+                    data: format!("{}: {:?}", p, cloned_events),
+                })
+            }
+            .boxed_local()
+        }
+    }
 
     #[async_std::test]
     async fn test_fallback_dispatcher() {
-        let local_handler = TestHandler {
+        let local_handler = EchoHandler {
             prefix: "handled locally".to_string(),
         };
-        let remote_handler = TestHandler {
-            prefix: "handled locally".to_string(),
+        let remote_handler = EchoHandler {
+            prefix: "handled remotely".to_string(),
         };
 
         let state = HashMap::new(); // Initialize state as per your implementation
@@ -252,7 +272,7 @@ mod tests {
         // Subscribe to monitor responses
         let received_responses = Arc::new(Mutex::new(vec![]));
         let responses_clone = received_responses.clone();
-        dispatcher
+        let closer = dispatcher
             .subscribe(Box::new(move |response| {
                 responses_clone.lock().unwrap().push(response);
             }))
@@ -266,14 +286,19 @@ mod tests {
 
         // Check results in received_responses
         let locked_responses = received_responses.lock().unwrap();
-        assert!(
-            !locked_responses.is_empty(),
-            "Responses should not be empty."
+        assert_eq!(locked_responses.len(), 1, "Should receive 1 responses");
+        assert_eq!(
+            locked_responses[0].data, "handled locally: [Event { remote: false, stateful: true, data: \"event1\" }, Event { remote: false, stateful: true, data: \"event2\" }]",
+            "Response data should match"
         );
-        // Add more specific checks as needed
 
-        // Check state consistency and correctness of processing
-        assert_eq!(dispatcher.state, state, "State should remain consistent.");
+        assert_eq!(
+            *dispatcher.state.clone().lock().unwrap(),
+            state,
+            "State should remain consistent."
+        );
+
+        closer();
 
         // Further checks can include specifics of response contents
     }
