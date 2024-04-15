@@ -1,11 +1,13 @@
-use wasm_bindgen::prelude::*;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    fallback::FallbackDispatcherOptions,
-    types::{Handler, Request, State},
+    fallback::{FallbackDispatcher, FallbackDispatcherOptions, SingleThreadedAsyncStdExecutor},
+    types::{BoxedFuture, Handler, Request, Response},
 };
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{future_to_promise, JsFuture};
+use futures::future::FutureExt;
+use js_sys::Function;
+use serde_wasm_bindgen::{from_value, to_value};
+use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 #[derive(Clone, Debug)]
@@ -75,44 +77,67 @@ impl JsResponse {
     }
 }
 
+pub struct JsHandler {
+    js_function: Function,
+}
+pub fn new_js_handler(js_value: JsValue) -> Result<JsHandler, JsValue> {
+    let js_function = js_value
+        .dyn_into::<Function>()
+        .map_err(|_| JsValue::from_str("Provided JsValue is not a function"))?;
+    Ok(JsHandler { js_function })
+}
+
+impl Handler for JsHandler {
+    fn handle(&self, req: Request) -> BoxedFuture<Response, String> {
+        let js_function = self.js_function.clone();
+
+        async move {
+            // Convert the request to a JsValue using serde_wasm_bindgen
+            let js_request = to_value(&req).unwrap();
+            // Call the JS function and await its promise
+            let js_result = js_function
+                .dyn_into::<js_sys::Function>()
+                .unwrap()
+                .call1(&JsValue::NULL, &js_request)
+                .unwrap();
+            let promise: js_sys::Promise = js_result.into();
+            let js_future = wasm_bindgen_futures::JsFuture::from(promise);
+            let result = js_future.await;
+
+            match result {
+                Ok(js_value) => {
+                    // Convert the result from JsValue back to a Rust Response struct
+                    from_value::<Response>(js_value).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.as_string().unwrap_or_else(|| "Unknown error".to_string())),
+            }
+        }
+        .boxed_local()
+    }
+}
+
 #[wasm_bindgen]
-pub struct JsDispatcher {
-    dispatcher: crate::fallback::FallbackDispatcher,
+struct JsDispatcher {
+    dispatcher: FallbackDispatcher,
 }
 
 #[wasm_bindgen]
 impl JsDispatcher {
     #[wasm_bindgen(constructor)]
-    pub fn new(local_handler: JsValue, remote_handler: JsValue) -> JsDispatcher {
-        // Validate that the provided JsValues are indeed functions
-        assert!(
-            local_handler.is_function(),
-            "local_handler must be a function"
+    pub fn new(local_js: JsValue, remote_js: JsValue) -> JsDispatcher {
+        let local_handler = Arc::new(new_js_handler(local_js).unwrap());
+        let remote_handler = Arc::new(new_js_handler(remote_js).unwrap());
+        let state = HashMap::new(); // Initialize state as per your implementation
+        let dispatcher = FallbackDispatcher::new(
+            Arc::new(SingleThreadedAsyncStdExecutor),
+            state.clone(),
+            local_handler,
+            remote_handler,
+            FallbackDispatcherOptions::default(),
         );
-        assert!(
-            remote_handler.is_function(),
-            "remote_handler must be a function"
-        );
-
-        let state = State::default(); // Ensure State has a default or an initial state is provided
-        let options = FallbackDispatcherOptions::default(); // Assuming it has defaults
-
-        // Convert JsValue to async Rust Handler
-        let make_handler = |js_func: JsValue| -> Handler {
-            Box::new(move |request: Request| {
-                let promise = js_func
-                    .call1(&JsValue::NULL, &JsValue::from_serde(&request).unwrap())
-                    .map_err(|e| format!("JS call failed: {:?}", e))
-                    .and_then(JsFuture::from)
-                    .and_then(|resp| {
-                        resp.into_serde::<Response>()
-                            .map_err(|e| format!("Deserialization failed: {:?}", e))
-                    })
-                    .boxed_local();
-
-                let pinned_box: BoxedFuture<Response, String> = Box::pin(promise);
-                pinned_box
-            })
-        };
+        JsDispatcher { dispatcher }
     }
+    #[wasm_bindgen]
+    pub fn submit(&self, events: Vec<JsEvent>) {}
+    // fn subscribe(&self, callback: Box<dyn Fn(Response) + Send>) -> Result<Closer, String>;
 }

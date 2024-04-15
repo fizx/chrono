@@ -1,5 +1,12 @@
-use crate::types::{Closer, Dispatcher, Event, Handler, Request, Response, State};
+use crate::types::{
+    BoxedFuture, Closer, Dispatcher, Event, Executor, Handler, Request, Response, State,
+};
+
+use async_std::prelude::*;
 use async_std::task;
+use async_std::task_local;
+use futures::executor;
+use futures::future::{BoxFuture, FutureExt};
 use std::{
     cmp::min,
     collections::HashMap,
@@ -29,10 +36,11 @@ impl Default for FallbackDispatcherOptions {
 }
 #[derive(Clone)]
 pub struct FallbackDispatcher {
+    executor: Arc<dyn Executor>,
     options: FallbackDispatcherOptions,
     state: State,
-    local_handler: Handler,
-    remote_handler: Handler,
+    local_handler: Arc<dyn Handler>,
+    remote_handler: Arc<dyn Handler>,
     sync_queue: Arc<Mutex<Vec<Event>>>,
     async_queue: Arc<Mutex<Vec<Event>>>,
     async_in_progress: Arc<Mutex<u32>>,
@@ -43,12 +51,14 @@ pub struct FallbackDispatcher {
 
 impl FallbackDispatcher {
     pub fn new(
+        executor: Arc<dyn Executor>,
         state: State,
-        local_handler: Handler,
-        remote_handler: Handler,
+        local_handler: Arc<dyn Handler>,
+        remote_handler: Arc<dyn Handler>,
         options: FallbackDispatcherOptions,
     ) -> FallbackDispatcher {
         FallbackDispatcher {
+            executor,
             options,
             state,
             local_handler,
@@ -109,11 +119,15 @@ impl FallbackDispatcher {
             }
             let self_clone = self.clone();
             *self.async_in_progress.lock().unwrap() += 1;
-            task::spawn(async move {
-                self_clone.handle_request(batch).await;
-                *self_clone.async_in_progress.lock().unwrap() -= 1;
-                self_clone.tick();
-            });
+            self.executor.spawn(
+                async move {
+                    self_clone.handle_request(batch).await;
+                    *self_clone.async_in_progress.lock().unwrap() -= 1;
+                    self_clone.tick();
+                    Ok(())
+                }
+                .boxed_local(),
+            )
         }
 
         while *self.sync_in_progress.lock().unwrap() < 1 {
@@ -125,11 +139,15 @@ impl FallbackDispatcher {
             }
             let self_clone = self.clone();
             *self.sync_in_progress.lock().unwrap() += 1;
-            task::spawn(async move {
-                self_clone.handle_request(batch).await;
-                *self_clone.sync_in_progress.lock().unwrap() -= 1;
-                self_clone.tick();
-            });
+            self.executor.spawn(
+                async move {
+                    self_clone.handle_request(batch).await;
+                    *self_clone.sync_in_progress.lock().unwrap() -= 1;
+                    self_clone.tick();
+                    Ok(())
+                }
+                .boxed_local(),
+            );
         }
     }
 }
@@ -161,6 +179,34 @@ impl Dispatcher for FallbackDispatcher {
         }))
     }
 }
+struct TestHandler {
+    pub prefix: String,
+}
+
+impl Handler for TestHandler {
+    fn handle(&self, req: Request) -> BoxedFuture<Response, String> {
+        let p = self.prefix.clone();
+        async move {
+            let cloned_state = req.state.clone();
+            let cloned_events = req.events.clone();
+            Ok(Response {
+                error_message: None,
+                state: cloned_state,
+                replay: vec![],
+                data: format!("{}: {:?}", p, cloned_events),
+            })
+        }
+        .boxed_local()
+    }
+}
+
+pub struct SingleThreadedAsyncStdExecutor;
+
+impl Executor for SingleThreadedAsyncStdExecutor {
+    fn spawn(&self, fut: BoxedFuture<()>) {
+        task::spawn_local(fut.map(|_| ()));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -169,43 +215,24 @@ mod tests {
     use crate::types::BoxedFuture;
 
     use super::*;
-    use async_std::prelude::*;
-    use async_std::task;
 
     // Simulated handlers for testing
-    fn local_handler(req: Request) -> BoxedFuture<Response> {
-        Box::pin(async move {
-            let cloned_state = req.state.clone();
-            let cloned_events = req.events.clone();
-            Ok(Response {
-                error_message: None,
-                state: cloned_state,
-                replay: vec![],
-                data: format!("Handled locally: {:?}", cloned_events),
-            })
-        })
-    }
-
-    fn remote_handler(req: Request) -> BoxedFuture<Response> {
-        Box::pin(async move {
-            let cloned_state = req.state.clone();
-            let cloned_events = req.events.clone();
-            Ok(Response {
-                error_message: None,
-                state: cloned_state,
-                replay: vec![],
-                data: format!("Handled remotely: {:?}", cloned_events),
-            })
-        })
-    }
 
     #[async_std::test]
     async fn test_fallback_dispatcher() {
+        let local_handler = TestHandler {
+            prefix: "handled locally".to_string(),
+        };
+        let remote_handler = TestHandler {
+            prefix: "handled locally".to_string(),
+        };
+
         let state = HashMap::new(); // Initialize state as per your implementation
         let dispatcher = FallbackDispatcher::new(
+            Arc::new(SingleThreadedAsyncStdExecutor),
             state.clone(),
-            local_handler,
-            remote_handler,
+            Arc::new(local_handler),
+            Arc::new(remote_handler),
             FallbackDispatcherOptions::default(),
         );
 
@@ -235,7 +262,7 @@ mod tests {
         dispatcher.submit(events).unwrap();
 
         // Allow some time for async processing
-        task::sleep(Duration::from_secs(1)).await;
+        task::sleep(Duration::from_millis(10)).await;
 
         // Check results in received_responses
         let locked_responses = received_responses.lock().unwrap();
